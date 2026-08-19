@@ -9,7 +9,7 @@ from google import genai
 from google.genai import errors as genai_errors
 from google.genai import types
 from pydantic import BaseModel, Field
-from tenacity import Retrying, retry_if_exception, stop_after_attempt, wait_exponential
+from tenacity import Retrying, retry_if_exception, wait_exponential
 
 logger = logging.getLogger("gemini_service")
 if not logger.handlers:
@@ -17,6 +17,13 @@ if not logger.handlers:
     _handler.setFormatter(logging.Formatter("[%(asctime)s] %(levelname)s %(name)s: %(message)s"))
     logger.addHandler(_handler)
 logger.setLevel(logging.INFO)
+
+# HTTPリクエストのタイムアウト(ミリ秒)。未設定だとGemini側が無応答のまま固まった場合に
+# 無期限に待機し続けてしまうため、必ず上限を設ける。
+# GENERATE_TIMEOUT_MS: 30例文フル生成は観測上おおよそ60〜90秒かかるため、十分な余裕を持たせる。
+# LOOKUP_TIMEOUT_MS: 単語1つの軽量ルックアップ用。
+GENERATE_TIMEOUT_MS = 150_000
+LOOKUP_TIMEOUT_MS = 60_000
 
 
 def _is_retryable_error(exc: BaseException) -> bool:
@@ -35,6 +42,11 @@ def _is_retryable_error(exc: BaseException) -> bool:
 def _is_rate_limit_error(exc: BaseException) -> bool:
     """429 RESOURCE_EXHAUSTED（クォータ/レートリミット超過）かどうか。"""
     return isinstance(exc, genai_errors.ClientError) and getattr(exc, "code", None) == 429
+
+
+def _is_timeout_error(exc: BaseException) -> bool:
+    """設定したタイムアウト秒数に達し、Gemini APIから応答が得られなかったかどうか。"""
+    return isinstance(exc, (httpx.TimeoutException, TimeoutError))
 
 
 def _extract_retry_delay_seconds(exc: BaseException) -> float | None:
@@ -71,16 +83,33 @@ def _gemini_wait(retry_state) -> float:
     return _FALLBACK_WAIT(retry_state)
 
 
+def _gemini_stop(retry_state) -> bool:
+    """タイムアウトは1回分の待機時間がすでに長いため、無駄な長時間待機を避けて
+    最大2回(初回+1回)までに抑える。503等の一時的なエラーは従来通り最大4回まで許容する。"""
+    exc = retry_state.outcome.exception() if retry_state.outcome and retry_state.outcome.failed else None
+    max_attempts = 2 if exc is not None and _is_timeout_error(exc) else 4
+    return retry_state.attempt_number >= max_attempts
+
+
 def _make_before_sleep(on_retry):
     def _before_sleep(retry_state) -> None:
         exc = retry_state.outcome.exception() if retry_state.outcome else None
         sleep_seconds = getattr(retry_state.next_action, "sleep", None)
         is_rate_limit = exc is not None and _is_rate_limit_error(exc)
+        is_timeout = exc is not None and _is_timeout_error(exc)
         wait_str = f"{sleep_seconds:.0f}" if sleep_seconds is not None else "?"
         if is_rate_limit:
             logger.warning(
                 "Gemini APIのレート制限(429 RESOURCE_EXHAUSTED)に達しました "
                 "(試行%d回目失敗、%s秒待機して自動リトライします): %r",
+                retry_state.attempt_number,
+                wait_str,
+                exc,
+            )
+        elif is_timeout:
+            logger.warning(
+                "Gemini APIの応答がタイムアウトしました "
+                "(試行%d回目失敗、%s秒待機して再試行します): %r",
                 retry_state.attempt_number,
                 wait_str,
                 exc,
@@ -98,6 +127,7 @@ def _make_before_sleep(on_retry):
                 on_retry(
                     {
                         "is_rate_limit": is_rate_limit,
+                        "is_timeout": is_timeout,
                         "attempt": retry_state.attempt_number,
                         "wait_seconds": sleep_seconds,
                         "error": exc,
@@ -112,7 +142,7 @@ def _make_before_sleep(on_retry):
 def _call_generate_content(client: genai.Client, *, on_retry=None, **kwargs):
     retrying = Retrying(
         retry=retry_if_exception(_is_retryable_error),
-        stop=stop_after_attempt(4),  # 初回 + 最大3回リトライ
+        stop=_gemini_stop,  # 通常は初回+最大3回、タイムアウトは初回+最大1回
         wait=_gemini_wait,
         before_sleep=_make_before_sleep(on_retry),
         reraise=True,
@@ -204,6 +234,14 @@ def is_rate_limit_error(exc: BaseException) -> bool:
     return cause is not None and _is_rate_limit_error(cause)
 
 
+def is_timeout_error(exc: BaseException) -> bool:
+    """GeminiServiceError（または元例外）がタイムアウトに起因するかどうか。"""
+    if _is_timeout_error(exc):
+        return True
+    cause = getattr(exc, "__cause__", None)
+    return cause is not None and _is_timeout_error(cause)
+
+
 KEY_TERM_INSTRUCTIONS = (
     "各例文の key_terms には、その例文の中でCompTIA Security+受験者・ITエンジニアが"
     "着目すべき重要な単語・熟語・実務複合語を3〜6個、網羅的に抽出してください。"
@@ -222,7 +260,14 @@ KEY_TERM_INSTRUCTIONS = (
 
 
 def _generate_structured(
-    client, contents, system_prompt, response_model, *, log_context: str, on_retry=None
+    client,
+    contents,
+    system_prompt,
+    response_model,
+    *,
+    log_context: str,
+    on_retry=None,
+    timeout_ms: int = GENERATE_TIMEOUT_MS,
 ):
     try:
         response = _call_generate_content(
@@ -235,6 +280,7 @@ def _generate_structured(
                 response_mime_type="application/json",
                 response_schema=response_model,
                 temperature=0.7,
+                http_options=types.HttpOptions(timeout=timeout_ms),
             ),
         )
     except Exception as exc:  # noqa: BLE001 - surface any API/network error to the UI
@@ -251,6 +297,13 @@ def _generate_structured(
             if detail:
                 logger.error("詳細(%s): %s", attr, detail)
         logger.error(traceback.format_exc())
+        if _is_timeout_error(exc):
+            timeout_seconds = timeout_ms / 1000
+            raise GeminiServiceError(
+                f"⏱️ Gemini APIから{timeout_seconds:.0f}秒待っても応答がありませんでした"
+                "（サーバー混雑または通信状況が原因の可能性があります）。"
+                "しばらく待ってから、もう一度実行してください。"
+            ) from exc
         raise GeminiServiceError(f"Gemini API呼び出しに失敗しました: {exc}") from exc
 
     if not response.text:
@@ -335,4 +388,5 @@ def lookup_keyword(term: str, on_retry=None, api_key: str | None = None) -> Keyw
         KeywordDictItem,
         log_context=f"lookup_keyword term={term!r}",
         on_retry=on_retry,
+        timeout_ms=LOOKUP_TIMEOUT_MS,
     )
