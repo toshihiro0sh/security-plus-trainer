@@ -1,5 +1,6 @@
 import csv
 import datetime as dt
+import html
 import io
 import json
 import os
@@ -295,7 +296,7 @@ def render_keyword_dict(kw: KeywordDictItem, key_prefix: str = "kwdict", show_pi
         )
 
 
-def derive(seed_text: str, key_terms: list[str], prefix: str, index) -> None:
+def derive(seed_text: str, key_terms: list[str]) -> None:
     seed_prompt = f"Target: {seed_text}\nKey Terms: {', '.join(key_terms)}"
     with st.spinner("派生学習コンテンツを生成中..."):
         try:
@@ -316,7 +317,7 @@ def derive(seed_text: str, key_terms: list[str], prefix: str, index) -> None:
 def start_from_keyword(keyword: str) -> None:
     """単語1つをシードに、履歴が空でも新規開始・既存履歴があれば派生学習として積む。"""
     st.session_state.first_layer_is_derived = True
-    derive(keyword, [keyword], "keyword_seed", keyword)
+    derive(keyword, [keyword])
 
 
 # ---------------------------------------------------------------------------
@@ -526,7 +527,7 @@ def render_word_detail_view() -> None:
             "<div style='font-size:0.8rem; opacity:0.65; letter-spacing:0.02em;'>"
             "📖 単語解説</div>"
             f"<div style='font-size:1.75rem; font-weight:800; line-height:1.3; "
-            f"margin-top:0.15rem;'>{term}</div>",
+            f"margin-top:0.15rem;'>{html.escape(term)}</div>",
             unsafe_allow_html=True,
         )
         st.caption(f"🔗 URL: `?word={term}` （リロード・このURLの共有でも同じ解説が復元されます）")
@@ -579,7 +580,7 @@ elif st.session_state.history:
                 "<div style='font-size:0.8rem; opacity:0.65; letter-spacing:0.02em;'>"
                 "🎯 現在の学習テーマ</div>"
                 f"<div style='font-size:1.75rem; font-weight:800; line-height:1.3; "
-                f"margin-top:0.15rem;'>{current_topic}</div>",
+                f"margin-top:0.15rem;'>{html.escape(current_topic)}</div>",
                 unsafe_allow_html=True,
             )
 
@@ -668,7 +669,7 @@ elif st.session_state.history:
                                     key=f"{prefix}_{i}_kw_{row_start + j}",
                                     use_container_width=True,
                                 ):
-                                    derive(kw.term, [kw.term], f"{prefix}_kw", f"{i}_{row_start + j}")
+                                    derive(kw.term, [kw.term])
 
         def render_examples(examples, prefix):
             category_label = CATEGORY_LABELS.get(prefix, prefix)
@@ -683,8 +684,6 @@ elif st.session_state.history:
                             derive(
                                 ex.en,
                                 [normalize_keyword(kw).term for kw in ex.key_terms],
-                                prefix,
-                                i,
                             )
                     with col_pin:
                         render_pin_controls(
