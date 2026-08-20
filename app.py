@@ -49,7 +49,10 @@ if "active_word" not in st.session_state:
     # None のときは通常の学習フロー（履歴タブ or ホーム画面）を表示する。
     st.session_state.active_word = None
 if "obsidian_vault" not in st.session_state:
-    st.session_state.obsidian_vault = "Vault"  # ピン留め保存先のObsidian Vault名
+    # ピン留め保存先のObsidian Vault名。空文字が既定値 -> obsidian://new URIで
+    # vaultパラメータを省略し、Obsidian側の現在アクティブなVaultに保存する
+    # （固定名を入れておくと存在しないVault名として"Vault not found"になるため）。
+    st.session_state.obsidian_vault = ""
 if "first_layer_is_derived" not in st.session_state:
     # 第1階層が「設問」由来か「単語シード」由来かを区別し、設問解説タブの見出し・
     # レイアウトを正しく切り替えるためのフラグ。
@@ -228,17 +231,30 @@ def format_pin_entry(emoji: str, label_ja: str, term: str, en_line: str, ja_line
 
 
 def build_obsidian_new_uri(vault: str, note: str, content: str) -> str:
-    """ネイティブの obsidian://new URIスキームで、既存ノート末尾への追記リンクを組み立てる。"""
-    params = {"vault": vault, "file": note, "content": content, "append": "true"}
+    """ネイティブの obsidian://new URIスキームで、既存ノート末尾への追記リンクを組み立てる。
+
+    vault が空文字の場合は vault パラメータ自体を省略する。Obsidianはvaultパラメータが
+    無いとき現在アクティブなVaultを対象にするため、固定のデフォルト名を送って存在しない
+    Vaultとして「Vault not found」になるのを避けられる。
+    各値は quote(..., safe="") で個別にパーセントエンコードしてから連結するため、
+    スペースや `+` `&` `=` などの記号がVault名・本文に含まれていても壊れない。
+    """
+    params = {}
+    if vault:
+        params["vault"] = vault
+    params["file"] = note
+    params["content"] = content
+    params["append"] = "true"
     query = "&".join(f"{k}={quote(v, safe='')}" for k, v in params.items())
     return f"obsidian://new?{query}"
 
 
 def render_pin_controls(term: str, en_line: str, ja_line: str, key_prefix: str) -> None:
     """3段階の重要度でObsidianへワンクリック追記保存 + Markdownコピーを提供する。"""
-    vault = (st.session_state.obsidian_vault or "Vault").strip() or "Vault"
+    vault = st.session_state.obsidian_vault.strip()
     with st.popover("📌 ピン留め / Obsidian保存", use_container_width=False, key=f"{key_prefix}_pin_popover"):
-        st.caption(f"保存先: **{vault}** vault ／ `{OBSIDIAN_NOTE_NAME}.md`（末尾に追記）")
+        vault_desc = f"**{vault}**" if vault else "現在開いている**アクティブなVault**"
+        st.caption(f"保存先: {vault_desc} ／ `{OBSIDIAN_NOTE_NAME}.md`（末尾に追記）")
         entries = {
             label_ja: format_pin_entry(emoji, label_ja, term, en_line, ja_line, tag)
             for emoji, label_ja, _label_en, tag in PIN_LEVELS
@@ -423,8 +439,13 @@ with st.sidebar:
             f"各例文・単語解説の「📌 ピン留め / Obsidian保存」ボタンから、指定Vaultの "
             f"`{OBSIDIAN_NOTE_NAME}.md` にMarkdown形式で追記保存できます"
             "（お使いの端末にObsidianデスクトップアプリが必要です）。"
+            "空欄のままなら、現在Obsidianで開いているアクティブなVaultに保存されます。"
         )
-        st.text_input("Vault名", key="obsidian_vault", placeholder="Vault")
+        st.text_input(
+            "Vault名（空欄可）",
+            key="obsidian_vault",
+            placeholder="空欄 = 現在開いているVault",
+        )
 
 # ---------------------------------------------------------------------------
 # エクスポート用ヘルパー
