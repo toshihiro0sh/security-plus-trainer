@@ -65,6 +65,18 @@ if "user_api_key" not in st.session_state:
     # 複数ユーザーが同時アクセスする公開環境でも他人と混ざらないよう
     # 絶対に os.environ には書き込まない。
     st.session_state.user_api_key = ""
+if "quiz_stats" not in st.session_state:
+    # 復習クイズの成績。term(小文字) -> {"term", "correct", "incorrect"}。
+    # セッションを通じて蓄積し、苦手単語の優先出題に使う。
+    st.session_state.quiz_stats = {}
+if "quiz_questions" not in st.session_state:
+    st.session_state.quiz_questions = []
+if "quiz_index" not in st.session_state:
+    st.session_state.quiz_index = 0
+if "quiz_active" not in st.session_state:
+    # True の間はメイン画面を復習クイズの専用ビューに切り替える
+    # （単語解説ビューの active_word と同様の「モード切り替えフラグ」）。
+    st.session_state.quiz_active = False
 
 
 def get_effective_api_key() -> str:
@@ -312,6 +324,130 @@ def render_keyword_dict(kw: KeywordDictItem, key_prefix: str = "kwdict", show_pi
         )
 
 
+# ---------------------------------------------------------------------------
+# 復習クイズ: これまでに生成済みの語彙データ（vocab_list/tech_terms/key_terms/
+# クイック検索結果）を素材に、追加のGemini呼び出しなしでその場に4択問題を組み立てる。
+# ---------------------------------------------------------------------------
+QUIZ_CHOICE_TEXT_LIMIT = 70
+
+
+class QuizTerm:
+    __slots__ = ("term", "meaning")
+
+    def __init__(self, term: str, meaning: str) -> None:
+        self.term = term
+        self.meaning = meaning
+
+
+def _truncate_for_quiz(text: str, limit: int = QUIZ_CHOICE_TEXT_LIMIT) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def collect_quiz_pool() -> dict[str, QuizTerm]:
+    """セッション内でこれまでに学習した単語・熟語を term(小文字) -> QuizTerm でまとめる。
+
+    同じ単語が複数回登場した場合は最初に見つかったものを採用する。
+    """
+    pool: dict[str, QuizTerm] = {}
+
+    def add(term: str, meaning: str) -> None:
+        term = term.strip()
+        meaning = meaning.strip()
+        if not term or not meaning:
+            return
+        key = term.lower()
+        if key not in pool:
+            pool[key] = QuizTerm(term=term, meaning=_truncate_for_quiz(meaning))
+
+    for result in st.session_state.history:
+        for v in result.vocab_list:
+            add(v.term, v.meaning)
+        for t in result.tech_terms:
+            add(t.term, t.concept)
+        for ex in result.business_examples + result.humor_examples + result.romance_examples:
+            for kw in ex.key_terms:
+                kw = normalize_keyword(kw)
+                add(kw.term, kw.meaning)
+
+    for kw in st.session_state.quick_lookup_cache.values():
+        kw = normalize_keyword(kw)
+        add(kw.term, kw.meaning)
+
+    return pool
+
+
+def build_quiz_questions(pool: dict[str, QuizTerm], n: int, weak_only: bool = False) -> list[dict]:
+    """pool から n 問の4択問題を組み立てる。
+
+    各問題は「単語→意味」「意味→単語」のどちらかをランダムに出題し、不正解の選択肢は
+    プール内の他の単語からランダムに抽出する（プールが小さい場合は選択肢数を減らす）。
+    """
+    candidates = list(pool.values())
+    if weak_only:
+        weak_terms = [
+            pool[key]
+            for key, s in st.session_state.quiz_stats.items()
+            if s["incorrect"] > 0 and key in pool
+        ]
+        if len(weak_terms) >= 2:
+            candidates = weak_terms
+
+    random.shuffle(candidates)
+    n = min(n, len(candidates))
+    questions: list[dict] = []
+    for qt in candidates[:n]:
+        others = [t for t in pool.values() if t.term.lower() != qt.term.lower()]
+        distractors = random.sample(others, k=min(3, len(others)))
+        direction = random.choice(["term_to_meaning", "meaning_to_term"])
+        if direction == "term_to_meaning":
+            prompt = f'🔤 「{qt.term}」の意味・用法として最も適切なものは？'
+            correct_choice = qt.meaning
+            choices = [qt.meaning] + [d.meaning for d in distractors]
+        else:
+            prompt = f'📖 次の意味・用法に当てはまる単語・熟語はどれ？\n\n"{qt.meaning}"'
+            correct_choice = qt.term
+            choices = [qt.term] + [d.term for d in distractors]
+        random.shuffle(choices)
+        questions.append(
+            {
+                "term_key": qt.term.lower(),
+                "term": qt.term,
+                "prompt": prompt,
+                "choices": choices,
+                "correct_index": choices.index(correct_choice),
+                "answered": False,
+                "selected_index": None,
+            }
+        )
+    return questions
+
+
+def _record_quiz_answer(term_key: str, term: str, is_correct: bool) -> None:
+    stats = st.session_state.quiz_stats.setdefault(term_key, {"term": term, "correct": 0, "incorrect": 0})
+    if is_correct:
+        stats["correct"] += 1
+    else:
+        stats["incorrect"] += 1
+
+
+def start_quiz(n: int, weak_only: bool = False) -> None:
+    pool = collect_quiz_pool()
+    st.session_state.quiz_questions = build_quiz_questions(pool, n, weak_only=weak_only)
+    st.session_state.quiz_index = 0
+    st.session_state.quiz_active = True
+    st.session_state.active_word = None
+    st.query_params.pop("word", None)
+    st.rerun()
+
+
+def exit_quiz() -> None:
+    st.session_state.quiz_active = False
+    st.session_state.quiz_questions = []
+    st.session_state.quiz_index = 0
+    st.rerun()
+
+
 def derive(seed_text: str, key_terms: list[str]) -> None:
     seed_prompt = f"Target: {seed_text}\nKey Terms: {', '.join(key_terms)}"
     with st.spinner("派生学習コンテンツを生成中..."):
@@ -419,6 +555,42 @@ with st.sidebar:
             if cache_key in st.session_state.quick_lookup_cache:
                 looked_up_kw = normalize_keyword(st.session_state.quick_lookup_cache[cache_key])
                 select_word(looked_up_kw.term)
+
+    st.divider()
+    st.subheader("🧠 復習クイズ")
+    _quiz_pool = collect_quiz_pool()
+    _weak_count = sum(1 for s in st.session_state.quiz_stats.values() if s["incorrect"] > 0)
+    st.caption(f"学習済み単語: {len(_quiz_pool)}語 ／ 苦手: {_weak_count}語")
+
+    if len(_quiz_pool) < 2:
+        st.caption("単語を2つ以上学習すると、ここから復習クイズに挑戦できます。")
+    else:
+        _quiz_max = min(20, len(_quiz_pool))
+        quiz_len = st.slider(
+            "問題数", min_value=1, max_value=_quiz_max, value=min(10, _quiz_max), key="quiz_len_slider"
+        )
+        quiz_weak_only = st.checkbox(
+            "苦手な単語を優先して出題",
+            key="quiz_weak_only",
+            help="過去に間違えたことのある単語が2語以上あれば、それらを中心に出題します。",
+        )
+        if st.button("🚀 クイズを開始", type="primary", use_container_width=True):
+            start_quiz(quiz_len, weak_only=quiz_weak_only)
+
+    if st.session_state.quiz_stats:
+        with st.expander("📊 苦手単語ランキング"):
+            ranked = sorted(
+                st.session_state.quiz_stats.values(),
+                key=lambda s: s["correct"] / max(s["correct"] + s["incorrect"], 1),
+            )
+            for s in ranked[:10]:
+                attempts = s["correct"] + s["incorrect"]
+                accuracy = (s["correct"] / attempts * 100) if attempts else 0
+                st.caption(f"- **{s['term']}**: 正答率 {accuracy:.0f}%（{s['correct']}/{attempts}）")
+            st.divider()
+            if st.button("🧹 クイズ成績をリセット", key="quiz_stats_reset"):
+                st.session_state.quiz_stats = {}
+                st.rerun()
 
     st.divider()
     with st.expander("🔑 独自のAPIキーを利用する（任意）"):
@@ -587,9 +759,76 @@ def render_word_detail_view() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 復習クイズビュー（単語解説ビューと同様、フラグが立っている間はメイン画面を占有する）
+# ---------------------------------------------------------------------------
+def render_quiz_view() -> None:
+    questions = st.session_state.quiz_questions
+    idx = st.session_state.quiz_index
+    total = len(questions)
+
+    if idx >= total:
+        correct_count = sum(
+            1 for q in questions if q["answered"] and q["selected_index"] == q["correct_index"]
+        )
+        with st.container(border=True):
+            st.markdown("### 🏁 クイズ結果")
+            st.markdown(f"## {correct_count} / {total} 問正解")
+            missed = [q["term"] for q in questions if q["answered"] and q["selected_index"] != q["correct_index"]]
+            if missed:
+                st.markdown("**苦手として記録した単語:**")
+                st.markdown(", ".join(missed))
+            else:
+                st.success("全問正解です！お見事！")
+
+        col_retry, col_exit = st.columns(2)
+        with col_retry:
+            if st.button("🔁 もう一度挑戦", use_container_width=True):
+                start_quiz(total)
+        with col_exit:
+            if st.button("⬅️ 学習に戻る", type="primary", use_container_width=True):
+                exit_quiz()
+        return
+
+    q = questions[idx]
+    st.progress(idx / total, text=f"問題 {idx + 1} / {total}")
+
+    with st.container(border=True):
+        st.markdown(f"### {q['prompt']}")
+        if not q["answered"]:
+            for i, choice in enumerate(q["choices"]):
+                if st.button(choice, key=f"quiz_choice_{idx}_{i}", use_container_width=True):
+                    q["answered"] = True
+                    q["selected_index"] = i
+                    _record_quiz_answer(q["term_key"], q["term"], i == q["correct_index"])
+                    st.rerun()
+        else:
+            for i, choice in enumerate(q["choices"]):
+                if i == q["correct_index"]:
+                    st.success(f"✅ {choice}")
+                elif i == q["selected_index"]:
+                    st.error(f"❌ {choice}")
+                else:
+                    st.markdown(f"- {choice}")
+
+            if q["selected_index"] == q["correct_index"]:
+                st.success("正解です！")
+            else:
+                st.warning(f"不正解…　正解は「{q['choices'][q['correct_index']]}」でした。")
+
+            if st.button("次の問題へ ➔", type="primary", use_container_width=True, key=f"quiz_next_{idx}"):
+                st.session_state.quiz_index += 1
+                st.rerun()
+
+    if st.button("⏹️ クイズを中断して学習に戻る", key=f"quiz_abort_{idx}"):
+        exit_quiz()
+
+
+# ---------------------------------------------------------------------------
 # メイン表示
 # ---------------------------------------------------------------------------
-if st.session_state.active_word:
+if st.session_state.quiz_active:
+    render_quiz_view()
+elif st.session_state.active_word:
     render_word_detail_view()
 elif st.session_state.history:
     try:
