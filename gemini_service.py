@@ -322,7 +322,7 @@ def _generate_structured(
 def analyze_and_generate(
     input_data,
     is_image: bool = False,
-    mode: str = "question",
+    mode: str = "question",  # "question" | "derived" | "combo"
     on_retry=None,
     api_key: str | None = None,
 ) -> SecurityPlusResponse:
@@ -338,6 +338,22 @@ def analyze_and_generate(
             "vocab_list と tech_terms は、このターゲットに関連する周辺語彙・概念を新たに掘り下げて生成してください。"
             "各例文カテゴリ（実務、ITジョーク、恋愛ウィット）には必ず10個ずつ、このターゲットおよび関連語彙を"
             "活用した高品質な例文を生成してください。\n"
+            f"{KEY_TERM_INSTRUCTIONS}"
+        )
+    elif mode == "combo":
+        system_prompt = (
+            "あなたはCompTIA Security+の専任指導教官および英語メンターです。"
+            "学習者は複数の単語・熟語（用語×用語、または用語×実務フレーズの組み合わせ）を"
+            "同時に学習したいと考えています。"
+            "入力の「Key Terms:」に列挙されたキーワードは、学習者が明示的に指定したものです。"
+            "表記・単数複数・大文字小文字を勝手に言い換えず、そのままの形で扱ってください。"
+            "translation にはこれらキーワードの組み合わせ全体の和訳・ニュアンスを、"
+            "correct_answer にはこれらがCompTIA Security+の実務でどのように関連し合うか"
+            "（例:一方がもう一方を実現する手段である、対比・補完し合う概念である 等）を解説してください。"
+            "vocab_list と tech_terms は、これらのキーワードに関連する周辺語彙・概念を生成してください。"
+            "最も重要な点として、生成する実務例文・ITジョーク・恋愛ウィット（各カテゴリ10個ずつ）は、"
+            "その大部分において指定された全てのキーワードを1つの文の中に不自然にならない範囲で"
+            "必ず含めてください。一部のキーワードだけを使った例文に偏ってはいけません。\n"
             f"{KEY_TERM_INSTRUCTIONS}"
         )
     else:

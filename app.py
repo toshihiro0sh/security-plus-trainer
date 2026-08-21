@@ -5,6 +5,7 @@ import io
 import json
 import os
 import random
+import re
 from pathlib import Path
 from urllib.parse import quote
 
@@ -229,15 +230,53 @@ PIN_LEVELS = [
 ]
 
 
-def format_pin_entry(emoji: str, label_ja: str, term: str, en_line: str, ja_line: str, tag: str) -> str:
-    """Obsidianへの保存・コピー用にMarkdown箇条書き1エントリを組み立てる。"""
+_TAG_WORD_RE = re.compile(r"[0-9A-Za-z぀-ヿ一-鿿]+")
+
+
+def sanitize_obsidian_tag(text: str, max_len: int = 30) -> str:
+    """Obsidianタグ(#tag)として安全な単一トークンに正規化する。
+
+    空白・記号（#, /, 改行, 絵文字 等 Obsidianのタグ構文を壊しうる文字）をすべて取り除き、
+    各単語の頭文字を大文字にして連結する
+    （例: "Zero Trust" -> "ZeroTrust", "mitigate the risk of" -> "MitigateTheRiskOf"）。
+    タグとして残せる文字が無い場合は空文字を返し、呼び出し側で除外できるようにする。
+    """
+    words = _TAG_WORD_RE.findall(text)
+    if not words:
+        return ""
+    combined = "".join(w[:1].upper() + w[1:] for w in words)
+    return combined[:max_len]
+
+
+def format_pin_entry(
+    emoji: str,
+    label_ja: str,
+    term: str,
+    en_line: str,
+    ja_line: str,
+    tag: str,
+    tag_terms: list[str] | None = None,
+) -> str:
+    """Obsidianへの保存・コピー用にMarkdown箇条書き1エントリを組み立てる。
+
+    tag_terms は例文中で使われた単語・熟語（複数キーワード組み合わせ学習の場合は
+    その全キーワード）を、重複除去のうえ #タグとして追加する。
+    """
     date_str = dt.date.today().isoformat()
     lines = [f"- [{emoji} {label_ja}] {term} / {date_str}"]
     if en_line:
         lines.append(f"    - EN: {en_line}")
     if ja_line:
         lines.append(f"    - JA: {ja_line}")
-    lines.append(f"    - Tags: #SecurityPlus #{tag}")
+
+    tag_line = f"    - Tags: #SecurityPlus #{tag}"
+    seen = {tag.lower()}
+    for t in tag_terms or []:
+        sanitized = sanitize_obsidian_tag(t)
+        if sanitized and sanitized.lower() not in seen:
+            seen.add(sanitized.lower())
+            tag_line += f" #{sanitized}"
+    lines.append(tag_line)
     lines.append("")
     return "\n".join(lines)
 
@@ -261,14 +300,24 @@ def build_obsidian_new_uri(vault: str, note: str, content: str) -> str:
     return f"obsidian://new?{query}"
 
 
-def render_pin_controls(term: str, en_line: str, ja_line: str, key_prefix: str) -> None:
-    """3段階の重要度でObsidianへワンクリック追記保存 + Markdownコピーを提供する。"""
+def render_pin_controls(
+    term: str,
+    en_line: str,
+    ja_line: str,
+    key_prefix: str,
+    tag_terms: list[str] | None = None,
+) -> None:
+    """3段階の重要度でObsidianへワンクリック追記保存 + Markdownコピーを提供する。
+
+    tag_terms を渡すと、#SecurityPlus #P1 等の既定タグに加えて、その単語・熟語
+    （複数キーワード組み合わせ学習の場合は関与した全キーワード）も #タグとして追加される。
+    """
     vault = st.session_state.obsidian_vault.strip()
     with st.popover("📌 ピン留め / Obsidian保存", use_container_width=False, key=f"{key_prefix}_pin_popover"):
         vault_desc = f"**{vault}**" if vault else "現在開いている**アクティブなVault**"
         st.caption(f"保存先: {vault_desc} ／ `{OBSIDIAN_NOTE_NAME}.md`（末尾に追記）")
         entries = {
-            label_ja: format_pin_entry(emoji, label_ja, term, en_line, ja_line, tag)
+            label_ja: format_pin_entry(emoji, label_ja, term, en_line, ja_line, tag, tag_terms)
             for emoji, label_ja, _label_en, tag in PIN_LEVELS
         }
         for emoji, label_ja, label_en, tag in PIN_LEVELS:
@@ -321,6 +370,7 @@ def render_keyword_dict(kw: KeywordDictItem, key_prefix: str = "kwdict", show_pi
             en_line=first_example.en if first_example else "",
             ja_line=first_example.ja if first_example else kw.meaning,
             key_prefix=f"{key_prefix}_{kw.term}",
+            tag_terms=[kw.term],
         )
 
 
@@ -448,13 +498,13 @@ def exit_quiz() -> None:
     st.rerun()
 
 
-def derive(seed_text: str, key_terms: list[str]) -> None:
+def derive(seed_text: str, key_terms: list[str], mode: str = "derived") -> None:
     seed_prompt = f"Target: {seed_text}\nKey Terms: {', '.join(key_terms)}"
     with st.spinner("派生学習コンテンツを生成中..."):
         try:
             new_result = analyze_and_generate(
                 seed_prompt,
-                mode="derived",
+                mode=mode,
                 on_retry=_on_gemini_retry,
                 api_key=get_effective_api_key(),
             )
@@ -470,6 +520,52 @@ def start_from_keyword(keyword: str) -> None:
     """単語1つをシードに、履歴が空でも新規開始・既存履歴があれば派生学習として積む。"""
     st.session_state.first_layer_is_derived = True
     derive(keyword, [keyword])
+
+
+# ---------------------------------------------------------------------------
+# 複数キーワード組み合わせ学習（用語×用語・用語×熟語）
+#
+# "Zero Trust, Microsegmentation" のようにカンマ等で明示的に区切られた入力のみを
+# 複数キーワードとして分割する。区切り文字の無い自由記述（例:"revoke a certificate"
+# のような、スペースを含む既存の単一熟語）を誤って分割すると、サイト全体で使われている
+# 単一熟語ルックアップ（例文中のキーワードpopover等）を壊してしまうため、
+# 意図的に「区切り文字が無ければ分割しない」設計にしている。
+# ---------------------------------------------------------------------------
+MAX_COMBO_KEYWORDS = 5
+_COMBO_DELIMITER_RE = re.compile(
+    r"\s*,\s*|\s*、\s*|\s*;\s*|\s*；\s*|\s*&\s*|\n+|\s+/\s+|\s+／\s+|\s+[x×]\s+",
+    re.IGNORECASE,
+)
+
+
+def split_combo_keywords(raw_text: str) -> list[str]:
+    """カンマ・スラッシュ(空白で挟まれた場合のみ)・"&"・"×"/"x" などの明示的な区切り文字が
+    ある場合のみ、複数キーワードとして分割する。区切りが無ければ元の文字列を1件のまま返す。
+    """
+    parts = [p.strip() for p in _COMBO_DELIMITER_RE.split(raw_text) if p.strip()]
+    if len(parts) < 2:
+        return [raw_text.strip()]
+    return parts[:MAX_COMBO_KEYWORDS]
+
+
+def looks_like_keyword_combo(raw_text: str, parts: list[str]) -> bool:
+    """メイン入力欄向けの安全策。実際の設問文（"?"を含む・断片が長い 等）を誤って
+    複数キーワードと誤認しないよう、断片がいずれも単語・熟語らしい短さの場合のみ
+    複数キーワード入力とみなす。
+    """
+    if len(parts) < 2 or "?" in raw_text:
+        return False
+    return all(len(p) <= 40 and len(p.split()) <= 6 for p in parts)
+
+
+def start_combo(keywords: list[str]) -> None:
+    """明示的な区切り文字で分割された複数キーワード（用語×用語・用語×熟語）の
+    組み合わせ学習を、現在の学習階層に積んで開始する。"""
+    label = " × ".join(keywords)
+    st.session_state.first_layer_is_derived = True
+    st.session_state.active_word = None
+    st.query_params.pop("word", None)
+    derive(label, keywords, mode="combo")
 
 
 # ---------------------------------------------------------------------------
@@ -491,6 +587,8 @@ with st.sidebar:
         if not uploaded_file and not text_input:
             st.warning("画像またはテキストを入力してください。")
             st.stop()
+        combo_parts = split_combo_keywords(text_input) if text_input else [text_input]
+        is_combo_input = not uploaded_file and looks_like_keyword_combo(text_input, combo_parts)
         with st.spinner("Geminiが解析＆30例文を生成中..."):
             try:
                 if uploaded_file:
@@ -502,6 +600,14 @@ with st.sidebar:
                         api_key=get_effective_api_key(),
                     )
                     label = "元の設問（画像）"
+                elif is_combo_input:
+                    result = analyze_and_generate(
+                        f"Target: {' × '.join(combo_parts)}\nKey Terms: {', '.join(combo_parts)}",
+                        mode="combo",
+                        on_retry=_on_gemini_retry,
+                        api_key=get_effective_api_key(),
+                    )
+                    label = " × ".join(combo_parts)[:24]
                 else:
                     result = analyze_and_generate(
                         text_input,
@@ -515,7 +621,7 @@ with st.sidebar:
                 st.stop()
         st.session_state.history = [result]
         st.session_state.labels = [label]
-        st.session_state.first_layer_is_derived = False
+        st.session_state.first_layer_is_derived = is_combo_input
         st.rerun()
 
     if st.session_state.history:
@@ -533,28 +639,38 @@ with st.sidebar:
 
     st.divider()
     st.subheader("🔍 クイック単語・熟語検索")
-    st.caption("検索結果はメイン画面の「単語解説」ビューに表示され、URLで復元・共有できます。")
-    lookup_term = st.text_input("単語・熟語を入力", key="quick_lookup_input")
+    st.caption(
+        "1語なら「単語解説」ビューへ。カンマ・スラッシュ・&・×等で区切って2語以上入力すると、"
+        "その組み合わせを使った例文・解説（用語×用語・用語×熟語）を生成します。"
+    )
+    lookup_term = st.text_input(
+        "単語・熟語を入力（例: Zero Trust, Microsegmentation）", key="quick_lookup_input"
+    )
     if st.button("調べる", key="quick_lookup_button"):
-        term = lookup_term.strip()
-        if not term:
+        raw_term = lookup_term.strip()
+        if not raw_term:
             st.warning("単語・熟語を入力してください。")
         else:
-            cache_key = term.lower()
-            if cache_key not in st.session_state.quick_lookup_cache:
-                with st.spinner(f'"{term}" を検索中...'):
-                    try:
-                        looked_up = lookup_keyword(
-                            term, on_retry=_on_gemini_retry, api_key=get_effective_api_key()
-                        )
-                    except GeminiServiceError as exc:
-                        _display_gemini_error(exc)
-                        looked_up = None
-                if looked_up is not None:
-                    st.session_state.quick_lookup_cache[cache_key] = looked_up
-            if cache_key in st.session_state.quick_lookup_cache:
-                looked_up_kw = normalize_keyword(st.session_state.quick_lookup_cache[cache_key])
-                select_word(looked_up_kw.term)
+            combo_keywords = split_combo_keywords(raw_term)
+            if len(combo_keywords) >= 2:
+                start_combo(combo_keywords)
+            else:
+                term = combo_keywords[0]
+                cache_key = term.lower()
+                if cache_key not in st.session_state.quick_lookup_cache:
+                    with st.spinner(f'"{term}" を検索中...'):
+                        try:
+                            looked_up = lookup_keyword(
+                                term, on_retry=_on_gemini_retry, api_key=get_effective_api_key()
+                            )
+                        except GeminiServiceError as exc:
+                            _display_gemini_error(exc)
+                            looked_up = None
+                    if looked_up is not None:
+                        st.session_state.quick_lookup_cache[cache_key] = looked_up
+                if cache_key in st.session_state.quick_lookup_cache:
+                    looked_up_kw = normalize_keyword(st.session_state.quick_lookup_cache[cache_key])
+                    select_word(looked_up_kw.term)
 
     st.divider()
     st.subheader("🧠 復習クイズ")
@@ -951,6 +1067,7 @@ elif st.session_state.history:
                             en_line=ex.en,
                             ja_line=ex.jp,
                             key_prefix=f"{prefix}_{i}_example",
+                            tag_terms=[normalize_keyword(kw).term for kw in ex.key_terms],
                         )
                     st.divider()
 
